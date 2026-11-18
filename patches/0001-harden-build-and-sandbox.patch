@@ -1,14 +1,3 @@
-diff --git a/.gitignore b/.gitignore
-index 3abde21..772a8cf 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -1,5 +1,6 @@
- miniaudio.o
- modem73
-+build/
- TODO
- test-dual.sh
- nohup.out
 diff --git a/Makefile b/Makefile
 index 96c2303..7becdda 100644
 --- a/Makefile
@@ -146,7 +135,7 @@ index bd9b753..1a0f29f 100644
  OBJS = deps/miniaudio.o deps/cJSON.o
  
  UI_FLAGS = -DWITH_UI
-@@ -52,14 +52,76 @@ else
+@@ -52,14 +52,46 @@ else
      HAMLIB_FLAGS =
  endif
  
@@ -182,36 +171,6 @@ index bd9b753..1a0f29f 100644
 +CXXFLAGS += $(HARDEN_CFLAGS) $(EXTRA_CFLAGS)
 +LDFLAGS += $(EXTRA_LDFLAGS)
 +
-+STAGE ?= build/stage
-+TIDY_SRCS = kiss_tnc.cc
-+ifneq ($(HAMLIB_FLAGS),)
-+    TIDY_SRCS += hamlib_ptt.cc
-+endif
-+
-+ifeq ($(SKIP_TIDY),)
-+
-+FIRST_PARTY := $(shell find . \( -path ./build -o -path ./.git \) -prune -o \( -name '*.hh' -o -name '*.cc' -o -name '*.h' -o -name '*.c' \) -print)
-+
-+.PHONY: all clean install
-+all: $(STAGE)/.tidy-stamp
-+	$(MAKE) -C $(STAGE) -f packaging/Makefile.pkg SKIP_TIDY=1 all
-+	cp -a $(STAGE)/$(TARGET) $(TARGET)
-+
-+install: all
-+	$(MAKE) -C $(STAGE) -f packaging/Makefile.pkg SKIP_TIDY=1 install \
-+	    DESTDIR='$(abspath $(DESTDIR))' PREFIX='$(PREFIX)'
-+
-+clean:
-+	rm -rf $(STAGE) $(TARGET) $(OBJS)
-+
-+$(STAGE)/.tidy-stamp: .clang-tidy packaging/clang-tidy-fix.sh packaging/apply-bounds-fixes.py packaging/apply-cast-fixes.py packaging/Makefile.pkg $(FIRST_PARTY)
-+	bash packaging/clang-tidy-fix.sh "$(abspath $(STAGE))" -- $(TIDY_SRCS) -- \
-+	    $(CXX) -std=c++17 -DMODEM73_VERSION=\"$(VERSION)\" \
-+	    $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(HIDAPI_CFLAGS) $(HAMLIB_CFLAGS) $(INCLUDES)
-+	touch $@
-+
-+else
-+
  .PHONY: all clean install
  all: $(TARGET)
  
@@ -225,9 +184,3 @@ index bd9b753..1a0f29f 100644
  
  $(TARGET): $(SRCS) $(HDRS) $(OBJS)
  	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
-@@ -78,3 +140,5 @@ ifneq ($(HIDAPI_LIBS),)
- endif
- 	install -d $(DESTDIR)$(PREFIX)/lib/udev/rules.d
- 	install -m 644 misc/60-gpio-ptt.rules $(DESTDIR)$(PREFIX)/lib/udev/rules.d/
-+
-+endif

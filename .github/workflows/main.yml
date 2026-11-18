@@ -87,7 +87,7 @@ jobs:
         run: |
           dnf -y install gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
             rpm-build redhat-rpm-config ruby ruby-devel hidapi-devel hamlib-devel \
-            clang-tools-extra libubsan python3 libseccomp-devel
+            libubsan libseccomp-devel
           gem install --no-document --no-user-install --no-format-executable --bindir /usr/bin fpm
           if ! command -v fpm >/dev/null; then
             FOUND="$(ls /usr/bin/fpm* "$(gem environment gemdir)"/bin/fpm* 2>/dev/null | head -1)"
