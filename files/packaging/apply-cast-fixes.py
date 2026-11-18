@@ -41,8 +41,14 @@ def unquote(value):
 
 def parse_unfixed(text):
     found = []
-    for match in UNFIXED.finditer(text):
-        found.append((unquote(match.group("path")), int(match.group("offset"))))
+    # Compiler errors are exported with an empty replacement list too.
+    # Only the cast diagnostic is a rewrite site.
+    for part in re.split(r"(?=DiagnosticName:)", text):
+        first = part.splitlines()[0] if part else ""
+        if "modernize-avoid-c-style-cast" not in first:
+            continue
+        for match in UNFIXED.finditer(part):
+            found.append((unquote(match.group("path")), int(match.group("offset"))))
     return found
 
 
@@ -220,7 +226,12 @@ def main():
     for path, offsets in grouped.items():
         file_path = Path(path)
         original = file_path.read_bytes()
-        edits = [rewrite_one(original, offset) for offset in offsets]
+        edits = []
+        for offset in offsets:
+            try:
+                edits.append(rewrite_one(original, offset))
+            except SystemExit as exc:
+                raise SystemExit(f"{path}: {exc}") from None
         updated = original
         for start, end, text in sorted(edits, reverse=True):
             updated = updated[:start] + text + updated[end:]

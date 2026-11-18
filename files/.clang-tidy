@@ -6,7 +6,9 @@ Checks: >
   -modernize-avoid-setjmp-longjmp,
   -modernize-avoid-variadic-functions,
   -modernize-use-trailing-return-type,
-  -modernize-return-braced-init-list
+  -modernize-return-braced-init-list,
+  -modernize-use-string-view,
+  -modernize-use-std-string-view
 InheritParentConfig: false
 FormatStyle: none
 # FixMode=at is reinterpreted by packaging/apply-bounds-fixes.py. clang-tidy
@@ -20,6 +22,10 @@ FormatStyle: none
 # modernize-return-braced-init-list warns on return std::vector<T>(first, last)
 # and return std::string(buf) but offers no fix. return {first, last} can call
 # the initializer_list constructor instead of the iterator constructor.
+# modernize-use-string-view (clang-tidy 23; the older name is
+# modernize-use-std-string-view) rewrites health_detail() and open_hint()
+# from std::string to std::string_view. Call sites concatenate those results
+# with string literals, and C++17 has no such operator.
 # C-style casts inside the modem template also have no clang-tidy fix.
 # packaging/apply-cast-fixes.py rewrites those to static_cast after the
 # modernize rounds.

@@ -94,7 +94,7 @@ fi
 
 # Keep these exclusions aligned with .clang-tidy. The bounds check is
 # intentionally absent: its --fix deletes the container token inside templates.
-modernize_config='{Checks: "modernize-*,-modernize-avoid-c-arrays,-modernize-avoid-setjmp-longjmp,-modernize-avoid-variadic-functions,-modernize-use-trailing-return-type,-modernize-return-braced-init-list", FormatStyle: none}'
+modernize_config='{Checks: "modernize-*,-modernize-avoid-c-arrays,-modernize-avoid-setjmp-longjmp,-modernize-avoid-variadic-functions,-modernize-use-trailing-return-type,-modernize-return-braced-init-list,-modernize-use-string-view,-modernize-use-std-string-view", FormatStyle: none}'
 hash_sources() {
     find . \( -path ./deps -o -path ./build \) -prune -o \
         \( -name '*.hh' -o -name '*.cc' \) -print \
