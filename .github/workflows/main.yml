@@ -1,0 +1,248 @@
+name: Build packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 2.5.0). A tag v<version> will be created.'
+        required: true
+        default: '2.5.0'
+      publish:
+        description: 'Publish a GitHub Release for this version'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  prep:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            RAW="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+          else
+            RAW="${{ github.event.inputs.version }}"
+            TAG="v${RAW}"
+          fi
+          V="$(printf '%s' "$RAW" | tr '-' '+')"
+          case "$V" in
+            [0-9]*) ;;
+            *) V="0.0.0+$V" ;;
+          esac
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${V} as ${TAG}"
+
+  build-rpm:
+    needs: prep
+    runs-on: ubuntu-24.04
+    container: fedora:45
+    steps:
+      - name: Bootstrap container
+        run: dnf -y install git ca-certificates tar gzip
+
+      - name: Checkout overlay
+        uses: actions/checkout@v7
+
+      - name: Read upstream pin
+        id: pin
+        run: |
+          # shellcheck disable=SC1091
+          . ./upstream.pin
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout modem73
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.pin.outputs.repository }}
+          ref: ${{ steps.pin.outputs.tag }}
+          path: src
+
+      - name: Verify upstream pin
+        working-directory: src
+        run: |
+          got=$(git rev-parse HEAD)
+          test "$got" = "${{ steps.pin.outputs.commit }}" || {
+            echo "::error::${{ steps.pin.outputs.tag }} is ${got}, pin is ${{ steps.pin.outputs.commit }}"
+            exit 1
+          }
+
+      - name: Apply overlay
+        run: ./apply-overlay.sh src
+
+      - name: Install build dependencies
+        run: |
+          dnf -y install gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
+            rpm-build redhat-rpm-config ruby ruby-devel hidapi-devel hamlib-devel \
+            clang-tools-extra libubsan python3 libseccomp-devel
+          gem install --no-document --no-user-install --no-format-executable --bindir /usr/bin fpm
+          if ! command -v fpm >/dev/null; then
+            FOUND="$(ls /usr/bin/fpm* "$(gem environment gemdir)"/bin/fpm* 2>/dev/null | head -1)"
+            if [ -n "$FOUND" ]; then
+              ln -sf "$FOUND" /usr/bin/fpm
+            else
+              printf '#!/bin/sh\nexec ruby -rrubygems -e '"'"'load Gem.activate_bin_path("fpm", "fpm", ">= 0")'"'"' -- "$@"\n' > /usr/bin/fpm
+              chmod +x /usr/bin/fpm
+            fi
+          fi
+          command -v fpm || { echo "::error::fpm not on PATH after gem install"; exit 1; }
+          fpm --version
+
+      - name: Build
+        working-directory: src
+        run: |
+          make -f packaging/Makefile.pkg \
+               CC=gcc CXX=g++ \
+               ARCH_FLAGS="-march=x86-64-v2" \
+               VERSION="${{ needs.prep.outputs.version }}" \
+               -j"$(nproc)"
+
+      - name: Verify linked libraries
+        working-directory: src
+        run: |
+          readelf -d modem73 | grep -q hidapi || {
+            echo "::error::binary is not linked against hidapi - CM108 PTT was silently disabled"
+            exit 1
+          }
+          readelf -d modem73 | grep -q hamlib || {
+            echo "::error::binary is not linked against hamlib - Hamlib PTT was silently disabled"
+            exit 1
+          }
+          readelf -d modem73 | grep -q libseccomp || {
+            echo "::error::binary is not linked against libseccomp"
+            exit 1
+          }
+          readelf -d modem73 | grep -q libubsan || {
+            echo "::error::binary is not linked against libubsan"
+            exit 1
+          }
+
+      - name: Stage install tree
+        working-directory: src
+        run: |
+          make -f packaging/Makefile.pkg install DESTDIR="$GITHUB_WORKSPACE/staging" PREFIX=/usr \
+               CC=gcc CXX=g++ \
+               ARCH_FLAGS="-march=x86-64-v2" \
+               VERSION="${{ needs.prep.outputs.version }}"
+
+      - name: Build .rpm
+        working-directory: src
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          HIDAPI_DEP=""
+          if [ -f "$GITHUB_WORKSPACE/staging/usr/lib/udev/rules.d/50-cm108-ptt.rules" ]; then
+            HIDAPI_DEP="-d hidapi"
+          fi
+          fpm -s dir -t rpm \
+            -n modem73 \
+            -v "${{ needs.prep.outputs.version }}" \
+            -a x86_64 \
+            --description "KISS TNC frontend for the aicodix OFDM modem." \
+            --url "https://github.com/${{ github.repository }}" \
+            --license "see LICENSE" \
+            --maintainer "modem73 maintainers" \
+            -d glibc \
+            -d libstdc++ \
+            -d ncurses-libs \
+            -d hamlib \
+            $HIDAPI_DEP \
+            -d libubsan \
+            -d libseccomp \
+            -C "$GITHUB_WORKSPACE/staging" \
+            -p "$GITHUB_WORKSPACE/dist/modem73_${{ needs.prep.outputs.version }}_fedora-45_x86_64.rpm" \
+            usr
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          for f in modem73_*.rpm; do
+            sha256sum "$f" | tee "${f}.sha256"
+            sha512sum "$f" | tee "${f}.sha512"
+          done
+
+      - name: Smoke test
+        run: |
+          RPM="$(ls dist/modem73_*.rpm)"
+          dnf -y install --nogpgcheck "./$RPM"
+          command -v modem73
+          rpm -ql modem73 | head -30
+          modem73 --help 2>&1 | grep -q Landlock
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-rpm-fedora-45-x86_64
+          path: dist/
+
+  release:
+    needs: [prep, build-rpm]
+    if: |
+      !cancelled() &&
+      needs.build-rpm.result == 'success' &&
+      ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Checkout overlay
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: pkg-rpm-fedora-45-x86_64
+          path: dist
+
+      - name: List artifacts
+        run: ls -l dist
+
+      - name: Attest release artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/modem73_*.rpm
+            dist/modem73_*.rpm.sha256
+            dist/modem73_*.rpm.sha512
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prep.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          files=(dist/modem73_*.rpm dist/modem73_*.rpm.sha256 dist/modem73_*.rpm.sha512)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::no release files"
+            exit 1
+          fi
+          # shellcheck disable=SC1091
+          . ./upstream.pin
+          notes=$(mktemp)
+          printf '%s\n' \
+            "Hardened Fedora 45 x86_64 build of ${repository} ${tag} (${commit})." \
+            "" \
+            "Verify a downloaded file:" \
+            "" \
+            "    gh attestation verify <file> --repo ${GITHUB_REPOSITORY}" \
+            > "$notes"
+          gh release create "$TAG" "${files[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file "$notes"

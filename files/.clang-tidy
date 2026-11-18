@@ -1,0 +1,28 @@
+Checks: >
+  -*,
+  cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+  modernize-*,
+  -modernize-avoid-c-arrays,
+  -modernize-avoid-setjmp-longjmp,
+  -modernize-avoid-variadic-functions,
+  -modernize-use-trailing-return-type,
+  -modernize-return-braced-init-list
+InheritParentConfig: false
+FormatStyle: none
+# FixMode=at is reinterpreted by packaging/apply-bounds-fixes.py. clang-tidy
+# itself drops the container name when operator[] is inside a template.
+#
+# modernize-use-trailing-return-type is excluded because its fix does not
+# parse as C++17 here: it drops an enclosing namespace (DSP::Complex becomes
+# Complex), it pastes the text "(lambda at file:line)" in as a return type,
+# and it writes "[&] -> bool" without the empty parameter list that C++17
+# requires. The three modernize-avoid-* checks have no autofix.
+# modernize-return-braced-init-list warns on return std::vector<T>(first, last)
+# and return std::string(buf) but offers no fix. return {first, last} can call
+# the initializer_list constructor instead of the iterator constructor.
+# C-style casts inside the modem template also have no clang-tidy fix.
+# packaging/apply-cast-fixes.py rewrites those to static_cast after the
+# modernize rounds.
+CheckOptions:
+  - key: cppcoreguidelines-pro-bounds-avoid-unchecked-container-access.FixMode
+    value: at

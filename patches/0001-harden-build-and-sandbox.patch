@@ -1,0 +1,233 @@
+diff --git a/.gitignore b/.gitignore
+index 3abde21..772a8cf 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ miniaudio.o
+ modem73
++build/
+ TODO
+ test-dual.sh
+ nohup.out
+diff --git a/Makefile b/Makefile
+index 96c2303..7becdda 100644
+--- a/Makefile
++++ b/Makefile
+@@ -39,7 +39,7 @@ LDFLAGS += $(NCURSES_LIBS)
+ TARGET = modem73
+ 
+ SRCS = kiss_tnc.cc
+-HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh net_audio.hh rigctl_ptt.hh hamlib_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh glyphs.hh control_port.hh attach_client.hh probe.hh
++HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh net_audio.hh rigctl_ptt.hh hamlib_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh glyphs.hh control_port.hh attach_client.hh probe.hh sandbox.hh
+ OBJS = deps/miniaudio.o deps/cJSON.o
+ 
+ # defualt to build with UI, headless operations through --headless
+@@ -74,15 +74,47 @@ else
+     HAMLIB_FLAGS =
+ endif
+ 
++# Landlock is a syscall. The seccomp filter needs libseccomp.
++SECCOMP_CFLAGS := $(shell pkg-config --cflags libseccomp 2>/dev/null)
++SECCOMP_LIBS := $(shell pkg-config --libs libseccomp 2>/dev/null)
++ifeq ($(SECCOMP_LIBS),)
++    $(error libseccomp-devel is required)
++endif
++CXXFLAGS += $(SECCOMP_CFLAGS)
++LDFLAGS += $(SECCOMP_LIBS)
++
++# -fhardened when this compiler accepts it. The extra flags come after it so
++# -fstack-protector-all replaces the strong protector that -fhardened selects.
++# GCC spells the requested -fexeptions flag as -fexceptions.
++UNAME_M := $(shell uname -m)
++HARDEN_OK := $(shell $(CXX) -fhardened -E -x c++ /dev/null -o /dev/null >/dev/null 2>&1 && echo yes)
++ifeq ($(HARDEN_OK),yes)
++    HARDEN_CFLAGS := -fhardened
++else
++    HARDEN_CFLAGS := -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS \
++        -ftrivial-auto-var-init=zero -fPIE -fstack-protector-strong -fstack-clash-protection
++    ifeq ($(UNAME_M),x86_64)
++        HARDEN_CFLAGS += -fcf-protection=full
++    endif
++    LDFLAGS += -pie -Wl,-z,now
++endif
++EXTRA_CFLAGS := -fsanitize=bounds-strict -fno-sanitize-recover=bounds \
++    -fno-strict-overflow -fstack-protector-all \
++    -fexceptions -fno-delete-null-pointer-checks
++EXTRA_LDFLAGS := -fsanitize=bounds-strict -Wl,-z,defs -Wl,--gc-sections -Wl,-z,relro
++CFLAGS += $(HARDEN_CFLAGS) $(EXTRA_CFLAGS)
++CXXFLAGS += $(HARDEN_CFLAGS) $(EXTRA_CFLAGS)
++LDFLAGS += $(EXTRA_LDFLAGS)
++
+ .PHONY: all clean install debug help
+ 
+ all: $(TARGET)
+ 
+ deps/miniaudio.o: deps/miniaudio.c deps/miniaudio.h
+-	$(CC) -c -O2 -o $@ deps/miniaudio.c
++	$(CC) -c -O2 $(CFLAGS) -o $@ deps/miniaudio.c
+ 
+ deps/cJSON.o: deps/cJSON.c deps/cJSON.h
+-	$(CC) -c -O2 -o $@ deps/cJSON.c
++	$(CC) -c -O2 $(CFLAGS) -o $@ deps/cJSON.c
+ 
+ $(TARGET): $(SRCS) $(HDRS) $(OBJS)
+ 	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
+diff --git a/kiss_tnc.cc b/kiss_tnc.cc
+index 3582f46..84f7a51 100644
+--- a/kiss_tnc.cc
++++ b/kiss_tnc.cc
+@@ -1,4 +1,5 @@
+ #include "kiss_tnc_impl.hh"
++#include "sandbox.hh"
+ #ifdef WITH_UI
+ #include "tnc_ui.hh"
+ #include "attach_client.hh"
+@@ -76,6 +77,18 @@ static int run_attached(const std::string& target) {
+         ui_state.presets_file = config_dir + "/presets";
+         ui_state.appearance_file = config_dir + "/appearance";
+     }
++    SandboxPolicy policy;
++    policy.attach_only = true;
++    policy.ui = true;
++    policy.audio_backend = "auto";
++    policy.attach_host = host;
++    policy.attach_port = port;
++    if (home != nullptr && home[0] != '\0')
++        policy.config_dir = std::string(home) + "/.config/modem73";
++    if (!install_sandbox(policy)) {
++        g_ui_state = nullptr;
++        return 1;
++    }
+     ui_state.load_presets();
+     ui_state.load_appearance();
+     ui_state.on_stop_requested = []() { g_running = false; };
+@@ -344,6 +357,8 @@ void print_help(const char* prog) {
+               << "      --list-cm108        List CM108-compatible devices and exit\n"
+ #endif
+               << "      --help              Show this help\n"
++              << "\nAfter these options are resolved, modem73 confines itself with Landlock\n"
++              << "and seccomp. A restart request then exits instead of re-executing.\n"
+               << "\nNetwork:\n"
+               << "  -p, --port PORT         KISS TCP port (default: 8001)\n"
+               << "      --bind ADDR         KISS bind address (default: 0.0.0.0)\n"
+@@ -1406,6 +1421,14 @@ int main(int argc, char** argv) {
+     if (config.csma_enabled)
+         config.tx_blanking_enabled = true;
+ 
++#ifdef WITH_UI
++    const std::string& settings_path = ui_state.config_file;
++#else
++    const std::string& settings_path = headless_settings_path;
++#endif
++    if (!install_sandbox(policy_from_config(config, settings_path, g_use_ui)))
++        return 1;
++
+     try {
+         KISSTNC tnc(config);
+         g_shutdown_tnc.store(&tnc);
+@@ -2189,6 +2212,7 @@ int main(int argc, char** argv) {
+     }
+     if (g_restart_requested.load()) {
+         std::cerr << "Restarting modem73" << std::endl;
++        // The sandbox refuses execve, so this falls through to status 3.
+         execv("/proc/self/exe", argv);
+         execvp(argv[0], argv);
+         std::cerr << "restart: exec failed, exiting with status 3" << std::endl;
+diff --git a/packaging/Makefile.pkg b/packaging/Makefile.pkg
+index bd9b753..1a0f29f 100644
+--- a/packaging/Makefile.pkg
++++ b/packaging/Makefile.pkg
+@@ -21,7 +21,7 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
+ 
+ TARGET = modem73
+ SRCS = kiss_tnc.cc
+-HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh gpio_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh control_port.hh
++HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh gpio_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh control_port.hh sandbox.hh
+ OBJS = deps/miniaudio.o deps/cJSON.o
+ 
+ UI_FLAGS = -DWITH_UI
+@@ -52,14 +52,76 @@ else
+     HAMLIB_FLAGS =
+ endif
+ 
++# Landlock is a syscall. The seccomp filter needs libseccomp.
++SECCOMP_CFLAGS := $(shell pkg-config --cflags libseccomp 2>/dev/null)
++SECCOMP_LIBS := $(shell pkg-config --libs libseccomp 2>/dev/null)
++ifeq ($(SECCOMP_LIBS),)
++    $(error libseccomp-devel is required)
++endif
++CXXFLAGS += $(SECCOMP_CFLAGS)
++LDFLAGS += $(SECCOMP_LIBS)
++
++# -fhardened when this compiler accepts it. The extra flags come after it so
++# -fstack-protector-all replaces the strong protector that -fhardened selects.
++# GCC spells the requested -fexeptions flag as -fexceptions.
++UNAME_M := $(shell uname -m)
++HARDEN_OK := $(shell $(CXX) -fhardened -E -x c++ /dev/null -o /dev/null >/dev/null 2>&1 && echo yes)
++ifeq ($(HARDEN_OK),yes)
++    HARDEN_CFLAGS := -fhardened
++else
++    HARDEN_CFLAGS := -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS \
++        -ftrivial-auto-var-init=zero -fPIE -fstack-protector-strong -fstack-clash-protection
++    ifeq ($(UNAME_M),x86_64)
++        HARDEN_CFLAGS += -fcf-protection=full
++    endif
++    LDFLAGS += -pie -Wl,-z,now
++endif
++EXTRA_CFLAGS := -fsanitize=bounds-strict -fno-sanitize-recover=bounds \
++    -fno-strict-overflow -fstack-protector-all \
++    -fexceptions -fno-delete-null-pointer-checks
++EXTRA_LDFLAGS := -fsanitize=bounds-strict -Wl,-z,defs -Wl,--gc-sections -Wl,-z,relro
++CFLAGS += $(HARDEN_CFLAGS) $(EXTRA_CFLAGS)
++CXXFLAGS += $(HARDEN_CFLAGS) $(EXTRA_CFLAGS)
++LDFLAGS += $(EXTRA_LDFLAGS)
++
++STAGE ?= build/stage
++TIDY_SRCS = kiss_tnc.cc
++ifneq ($(HAMLIB_FLAGS),)
++    TIDY_SRCS += hamlib_ptt.cc
++endif
++
++ifeq ($(SKIP_TIDY),)
++
++FIRST_PARTY := $(shell find . \( -path ./build -o -path ./.git \) -prune -o \( -name '*.hh' -o -name '*.cc' -o -name '*.h' -o -name '*.c' \) -print)
++
++.PHONY: all clean install
++all: $(STAGE)/.tidy-stamp
++	$(MAKE) -C $(STAGE) -f packaging/Makefile.pkg SKIP_TIDY=1 all
++	cp -a $(STAGE)/$(TARGET) $(TARGET)
++
++install: all
++	$(MAKE) -C $(STAGE) -f packaging/Makefile.pkg SKIP_TIDY=1 install \
++	    DESTDIR='$(abspath $(DESTDIR))' PREFIX='$(PREFIX)'
++
++clean:
++	rm -rf $(STAGE) $(TARGET) $(OBJS)
++
++$(STAGE)/.tidy-stamp: .clang-tidy packaging/clang-tidy-fix.sh packaging/apply-bounds-fixes.py packaging/apply-cast-fixes.py packaging/Makefile.pkg $(FIRST_PARTY)
++	bash packaging/clang-tidy-fix.sh "$(abspath $(STAGE))" -- $(TIDY_SRCS) -- \
++	    $(CXX) -std=c++17 -DMODEM73_VERSION=\"$(VERSION)\" \
++	    $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(HIDAPI_CFLAGS) $(HAMLIB_CFLAGS) $(INCLUDES)
++	touch $@
++
++else
++
+ .PHONY: all clean install
+ all: $(TARGET)
+ 
+ deps/miniaudio.o: deps/miniaudio.c deps/miniaudio.h
+-	$(CC) -c -O2 -o $@ deps/miniaudio.c
++	$(CC) -c -O2 $(CFLAGS) -o $@ deps/miniaudio.c
+ 
+ deps/cJSON.o: deps/cJSON.c deps/cJSON.h
+-	$(CC) -c -O2 -o $@ deps/cJSON.c
++	$(CC) -c -O2 $(CFLAGS) -o $@ deps/cJSON.c
+ 
+ $(TARGET): $(SRCS) $(HDRS) $(OBJS)
+ 	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
+@@ -78,3 +140,5 @@ ifneq ($(HIDAPI_LIBS),)
+ endif
+ 	install -d $(DESTDIR)$(PREFIX)/lib/udev/rules.d
+ 	install -m 644 misc/60-gpio-ptt.rules $(DESTDIR)$(PREFIX)/lib/udev/rules.d/
++
++endif
