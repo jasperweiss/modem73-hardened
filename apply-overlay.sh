@@ -11,7 +11,14 @@ if [[ ! -f "$dest/kiss_tnc.cc" || ! -f "$dest/packaging/Makefile.pkg" ]]; then
     exit 1
 fi
 
-patch="$root/patches/0001-harden-build-and-sandbox.patch"
-git -C "$dest" apply --check "$patch"
-git -C "$dest" apply "$patch"
+shopt -s nullglob
+patches=("$root"/patches/*.patch)
+if (( ${#patches[@]} == 0 )); then
+    echo "apply-overlay: no patches in $root/patches" >&2
+    exit 1
+fi
+for patch in "${patches[@]}"; do
+    git -C "$dest" apply --check "$patch"
+    git -C "$dest" apply "$patch"
+done
 cp -a "$root/files/." "$dest/"

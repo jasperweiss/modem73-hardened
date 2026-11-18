@@ -187,11 +187,28 @@ jobs:
           name: pkg-rpm-fedora-45-x86_64
           path: dist/
 
+  fuzz:
+    needs: prep
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout overlay
+        uses: actions/checkout@v7
+
+      - name: Install Clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Build and run fuzzer
+        run: |
+          ./fuzz/build.sh "${RUNNER_TEMP}/m73-fuzz"
+          # LeakSanitizer aborts when ptrace is blocked. This job checks ASan and UBSan.
+          ASAN_OPTIONS=detect_leaks=0 "${RUNNER_TEMP}/m73-fuzz/fuzz-kernels" -max_total_time=60
+
   release:
-    needs: [prep, build-rpm]
+    needs: [prep, build-rpm, fuzz]
     if: |
       !cancelled() &&
       needs.build-rpm.result == 'success' &&
+      needs.fuzz.result == 'success' &&
       ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
        (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))
     runs-on: ubuntu-24.04

@@ -1,0 +1,330 @@
+diff --git a/modem.hh b/modem.hh
+index b77477c..9f9a36c 100644
+--- a/modem.hh
++++ b/modem.hh
+@@ -6,6 +6,7 @@
+ #include <functional>
+ #include <atomic>
+ #include <algorithm>
++#include "window.hh"
+ 
+ 
+ #include "phy/common.hh"
+@@ -966,6 +967,7 @@ private:
+     }
+     
+     void process_sample(value sample, FrameCallback callback) {
++        sample = finite_sample(sample);
+ #if IMPULSE_BLANKER
+         {
+             value mag = std::abs(sample);
+@@ -992,6 +994,7 @@ private:
+             sample = bandpass(sample);
+         // Convert to complex via Hilbert transform
+         cmplx tmp = hilbert(blockdc(sample));
++        tmp = cmplx(finite_sample(tmp.real()), finite_sample(tmp.imag()));
+         buf_ = input_hist(tmp);
+         ring_[ring_count_ % ring_len] = tmp;
+         ++ring_count_;
+@@ -1004,7 +1007,10 @@ private:
+                 ++stats_sync_count;
+                 symbol_pos = correlator_ptr->symbol_pos;
+                 cfo_rad = correlator_ptr->cfo_rad;
+-                if (symbol_pos < 0) {
++                // Preamble reads symbol_pos through symbol_pos + 2*symbol_len
++                // + extended_len inside the correlator's buffer_len samples.
++                if (symbol_pos < 0 ||
++                    symbol_pos > buffer_len - (2 * symbol_len + extended_len)) {
+                     ++stats_preamble_errors;
+                     reset();
+                     break;
+@@ -1902,9 +1908,14 @@ private:
+         replaying_ = true;
+         bool ok = false;
+         for (const auto& a : attempts) {
+-            if (frame_symbol_pos_ + a.dt < 0)
++            int64_t pre = (int64_t)frame_symbol_pos_ + a.dt;
++            if (pre < 0 ||
++                !window_at(frame_raw_, (size_t)pre,
++                           (size_t)(2 * symbol_len + extended_len)))
+                 continue;
+-            if ((size_t)(frame_sym_start_[last] + a.dt + symbol_len) > frame_raw_.size())
++            int64_t last_at = (int64_t)frame_sym_start_[last] + a.dt;
++            if (last_at < 0 ||
++                !window_at(frame_raw_, (size_t)last_at, (size_t)symbol_len))
+                 continue;
+             forced_alpha_ = a.alpha;
+             symbol_pos = frame_symbol_pos_ + a.dt;
+@@ -1915,7 +1926,11 @@ private:
+                 continue;
+             bool bad = false;
+             for (int j = 1; j <= symbol_count; ++j) {
+-                buf_ = frame_raw_.data() + frame_sym_start_[j] + a.dt;
++                int64_t at = (int64_t)frame_sym_start_[j] + a.dt;
++                const cmplx* sym = at < 0 ? nullptr
++                    : window_at(frame_raw_, (size_t)at, (size_t)symbol_len);
++                if (!sym) { bad = true; break; }
++                buf_ = sym;
+                 if (!process_symbol(j)) { bad = true; break; }
+             }
+             if (bad)
+@@ -1931,6 +1946,8 @@ private:
+     }
+ 
+     bool decode_frame(FrameCallback callback) {
++        if (code_order < 0 || code_order > code_max)
++            return false;
+         std::cerr << "Decoder: Decoding frame, k_=" << k_ << " bits collected" << std::endl;
+         std::cerr << "Decoder: Expected code_order=" << code_order << " (code length=" << (1 << code_order) << ")" << std::endl;
+         
+diff --git a/phy/mfsk_modem.hh b/phy/mfsk_modem.hh
+index 124bf13..e81a208 100644
+--- a/phy/mfsk_modem.hh
++++ b/phy/mfsk_modem.hh
+@@ -10,6 +10,7 @@
+ #include <complex>
+ #include "complex.hh"
+ #include "fft.hh"
++#include "../window.hh"
+ 
+ #ifndef M_PI
+ #define M_PI 3.14159265358979323846
+@@ -451,7 +452,8 @@ public:
+     void process(const float* samples, size_t count, FrameCallback callback) {
+         for (size_t i = 0; i < count; i++) {
+             mix_ph_ *= mix_step_;
+-            hist_[hist_pos_] = mix_ph_ * samples[i];
++            float in = finite_sample(samples[i]);
++            hist_[hist_pos_] = mix_ph_ * in;
+             hist_pos_ = (hist_pos_ + 1) & (FIR_LEN - 1);
+             if (++dec_cnt_ == DEC) {
+                 dec_cnt_ = 0;
+@@ -461,6 +463,8 @@ public:
+                     acc += fir_[k] * hist_[idx];
+                     idx = (idx + 1) & (FIR_LEN - 1);
+                 }
++                acc = std::complex<float>(finite_sample(acc.real()),
++                                          finite_sample(acc.imag()));
+                 buf_.push_back(acc);
+             }
+             if (++renorm_cnt_ >= 4096) {
+@@ -474,7 +478,10 @@ public:
+             if (buf_.size() - buf_pos_ < (size_t)DSYM)
+                 break;
+ 
+-            const std::complex<float>* window = buf_.data() + buf_pos_;
++            const std::complex<float>* window =
++                window_at(buf_, buf_pos_, (size_t)DSYM);
++            if (!window)
++                break;
+ 
+             switch (state_) {
+             case State::SEARCHING: {
+@@ -534,18 +541,23 @@ public:
+                             if (pos < DSYM ||
+                                 pos + DSYM > (int64_t)buf_.size())
+                                 continue;
+-                            float e = mfsk_detail::dft_mag2(
+-                                          buf_.data() + pos, DSYM, sync3_bin)
+-                                    + mfsk_detail::dft_mag2(
+-                                          buf_.data() + pos - DSYM,
+-                                          DSYM, sync1_bin);
++                            const std::complex<float>* w0 =
++                                window_at(buf_, (size_t)pos, (size_t)DSYM);
++                            const std::complex<float>* w1 =
++                                window_at(buf_, (size_t)(pos - DSYM), (size_t)DSYM);
++                            if (!w0 || !w1)
++                                continue;
++                            float e = mfsk_detail::dft_mag2(w0, DSYM, sync3_bin)
++                                    + mfsk_detail::dft_mag2(w1, DSYM, sync1_bin);
+                             if (pos >= 3 * DSYM) {
+-                                e += mfsk_detail::dft_mag2(
+-                                         buf_.data() + pos - 2 * DSYM,
+-                                         DSYM, pre_hi_bin)
+-                                   + mfsk_detail::dft_mag2(
+-                                         buf_.data() + pos - 3 * DSYM,
+-                                         DSYM, pre_lo_bin);
++                                const std::complex<float>* w2 =
++                                    window_at(buf_, (size_t)(pos - 2 * DSYM), (size_t)DSYM);
++                                const std::complex<float>* w3 =
++                                    window_at(buf_, (size_t)(pos - 3 * DSYM), (size_t)DSYM);
++                                if (!w2 || !w3)
++                                    continue;
++                                e += mfsk_detail::dft_mag2(w2, DSYM, pre_hi_bin)
++                                   + mfsk_detail::dft_mag2(w3, DSYM, pre_lo_bin);
+                             }
+                             if (e > best_e) {
+                                 best_e = e;
+@@ -574,10 +586,15 @@ public:
+                     // shifts the sub-bin peak, so it must run on the
+                     // aligned window.
+                     {
+-                        const std::complex<float>* wa = buf_.data() + buf_pos_;
+-                        const std::complex<float>* w1a = buf_pos_ >= (size_t)DSYM
+-                                           ? wa - DSYM : nullptr;
++                        const std::complex<float>* wa =
++                            window_at(buf_, buf_pos_, (size_t)DSYM);
++                        const std::complex<float>* w1a =
++                            buf_pos_ >= (size_t)DSYM
++                                ? window_at(buf_, buf_pos_ - (size_t)DSYM, (size_t)DSYM)
++                                : nullptr;
+                         auto aligned_energy = [&](float foff) {
++                            if (!wa)
++                                return 0.f;
+                             float e = mfsk_detail::dft_mag2(wa, DSYM,
+                                         dbase_ + foff + sync3_tone_);
+                             if (w1a)
+@@ -634,7 +651,10 @@ public:
+                         int64_t pos = (int64_t)buf_pos_ + adj;
+                         if (pos < 0 || pos + DSYM > (int64_t)buf_.size())
+                             continue;
+-                        const std::complex<float>* w = buf_.data() + pos;
++                        const std::complex<float>* w =
++                            window_at(buf_, (size_t)pos, (size_t)DSYM);
++                        if (!w)
++                            continue;
+                         float max_e = 0, total_e = 0;
+                         for (int t = 0; t < n_tones_; t++) {
+                             float e = mfsk_detail::dft_mag2(w, DSYM, dbase_ + freq_offset_ + t);
+@@ -648,7 +668,7 @@ public:
+                     if (best_adj != 0 && best_ratio > center_ratio * 1.02f) {
+                         if (best_adj >= 0) buf_pos_ += best_adj;
+                         else buf_pos_ -= (size_t)(-best_adj);
+-                        window = buf_.data() + buf_pos_;
++                        window = window_at(buf_, buf_pos_, (size_t)DSYM);
+                     }
+ 
+                     // Frequency drift nudge: accumulate +-1/8-bin evidence
+@@ -662,6 +682,10 @@ public:
+                         for (int k = 1; k <= back; k++) {
+                             if (buf_pos_ < (size_t)k * DSYM)
+                                 break;
++                            const std::complex<float>* wk =
++                                window_at(buf_, buf_pos_ - (size_t)k * DSYM, (size_t)DSYM);
++                            if (!wk)
++                                break;
+                             const auto& en_vec = collected_[collect_count_ - k];
+                             int best_t = 0;
+                             float best_te = 0, mean = 0;
+@@ -672,11 +696,10 @@ public:
+                             mean /= n_tones_;
+                             if (best_te < 4.0f * mean)
+                                 continue;
+-                            const std::complex<float>* w = buf_.data() + buf_pos_ - (size_t)k * DSYM;
+                             e0 += best_te;
+-                            em += mfsk_detail::dft_mag2(w, DSYM,
++                            em += mfsk_detail::dft_mag2(wk, DSYM,
+                                     dbase_ + freq_offset_ - 0.125f + best_t);
+-                            ep += mfsk_detail::dft_mag2(w, DSYM,
++                            ep += mfsk_detail::dft_mag2(wk, DSYM,
+                                     dbase_ + freq_offset_ + 0.125f + best_t);
+                         }
+                         if (e0 > 0) {
+@@ -688,6 +711,10 @@ public:
+                     }
+                 }
+ 
++                if (!window) {
++                    stall = true;
++                    break;
++                }
+                 std::vector<float> energies(n_tones_);
+                 for (int t = 0; t < n_tones_; t++)
+                     energies[t] = mfsk_detail::dft_mag2(window, DSYM,
+@@ -919,7 +946,9 @@ private:
+ 
+         for (int i = 0; i < MFSKParams::DATA_SYMBOLS; i++) {
+             if ((size_t)pos + DSYM > buf_.size()) return false;
+-            const std::complex<float>* w = buf_.data() + pos;
++            const std::complex<float>* w =
++                window_at(buf_, (size_t)pos, (size_t)DSYM);
++            if (!w) return false;
+             std::vector<float> energies(n_tones_);
+             for (int t = 0; t < n_tones_; t++)
+                 energies[t] = mfsk_detail::dft_mag2(w, DSYM,
+@@ -991,7 +1020,7 @@ private:
+ 
+         ViterbiDecoder viterbi;
+         viterbi.reset();
+-        for (int s = 0; s < n_steps && s * 2 + 1 < soft_len; s++)
++        for (int s = 0; s < n_steps && s < ViterbiDecoder::MAX_STEPS && s * 2 + 1 < soft_len; s++)
+             viterbi.step(soft_ptr[s * 2], soft_ptr[s * 2 + 1]);
+ 
+         auto bytes = viterbi.finish(data_bits);
+diff --git a/phy/robust_modem.hh b/phy/robust_modem.hh
+index 2b9b152..f8ada36 100644
+--- a/phy/robust_modem.hh
++++ b/phy/robust_modem.hh
+@@ -15,6 +15,7 @@
+ #include <cmath>
+ #include <functional>
+ #include <algorithm>
++#include "../window.hh"
+ #include "common.hh"
+ #include "polar_tables_short.hh"
+ #include "polar_tables_micro.hh"
+@@ -498,7 +499,7 @@ public:
+ 
+     void process(const float* samples, size_t count, FrameCallback callback) {
+         for (size_t s = 0; s < count; ++s) {
+-            value smp = samples[s];
++            value smp = finite_sample(samples[s]);
+ #if IMPULSE_BLANKER
+             {
+                 value mag = std::abs(smp);
+@@ -522,6 +523,7 @@ public:
+             }
+ #endif
+             cmplx x = hilbert_(blockdc_(bandpass(smp)));
++            x = cmplx(finite_sample(x.real()), finite_sample(x.imag()));
+             buf_.push_back(x);
+             ++total_in_;
+             int64_t n = (int64_t)buf_.size() - 1;
+@@ -991,9 +993,16 @@ private:
+     static constexpr int64_t COLLECT_STALE = 2 * DCD_GRACE;
+ 
+     void scan_fft(int64_t start, cmplx* bins) {
++        const cmplx* w = start < 0 ? nullptr
++            : window_at(buf_, (size_t)start, (size_t)RobustParams::NFFT);
++        if (!w) {
++            for (int k = 0; k < nc_ + 4; ++k)
++                bins[k] = cmplx(0, 0);
++            return;
++        }
+         cmplx tdom[RobustParams::NFFT], fdom[RobustParams::NFFT];
+         for (int i = 0; i < RobustParams::NFFT; ++i)
+-            tdom[i] = buf_[start + i];
++            tdom[i] = w[i];
+         fwd_(fdom, tdom);
+         for (int k = 0; k < nc_ + 4; ++k)
+             bins[k] = fdom[base_ - 2 + k];
+@@ -1218,10 +1227,17 @@ private:
+     }
+ 
+     void window_fft(int64_t start, cmplx* bins) {
++        const cmplx* w = start < 0 ? nullptr
++            : window_at(buf_, (size_t)start, (size_t)RobustParams::NFFT);
++        if (!w) {
++            for (int k = 0; k < nc_ + 4; ++k)
++                bins[k] = cmplx(0, 0);
++            return;
++        }
+         cmplx tdom[RobustParams::NFFT], fdom[RobustParams::NFFT];
+         for (int i = 0; i < RobustParams::NFFT; ++i) {
+             value ph = -omega_ * (value)(start + i - frame_pos_);
+-            tdom[i] = buf_[start + i] * DSP::polar<value>(1, ph);
++            tdom[i] = w[i] * DSP::polar<value>(1, ph);
+         }
+         fwd_(fdom, tdom);
+         for (int k = 0; k < nc_ + 4; ++k)
+@@ -1922,6 +1938,10 @@ private:
+     bool try_decode(RobustMode mode, FrameCallback callback, bool enhanced = false) {
+         using namespace robust_detail;
+         const int order = RobustParams::code_order(mode);
++        // PolarListDecoder<..., 14> only has storage through order 14.
++        // The modes use 10, 12, 13, and 14. Anything else is not a frame.
++        if (order != 10 && order != 12 && order != 13 && order != 14)
++            return false;
+         const int cbits = RobustParams::code_bits(mode);
+         const int nrows = RobustParams::nrows(mode);
+         const int copies = RobustParams::copies(mode);
