@@ -4,7 +4,10 @@
 // the settings file have been resolved. Filesystem and TCP/UDP rights follow
 // from those settings. Everything else in the handled set is denied.
 // execve is refused with EPERM so the in-process restart path can exit
-// instead of being killed. Any other unexpected syscall kills the process.
+// instead of being killed. Internet datagrams are refused unless a hostname
+// needs DNS on a kernel that can confine UDP. memfd must carry the noexec
+// seal, and MDWE refuses gaining execute on a writable mapping. Any other
+// unexpected syscall kills the process.
 
 #include "kiss_tnc.hh"
 
@@ -20,12 +23,23 @@
 #include <netinet/in.h>
 #include <seccomp.h>
 #include <string>
+#include <linux/memfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#ifndef PR_SET_MDWE
+#define PR_SET_MDWE 65
+#endif
+#ifndef PR_MDWE_REFUSE_EXEC_GAIN
+#define PR_MDWE_REFUSE_EXEC_GAIN (1UL << 0)
+#endif
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
+#endif
 #include <vector>
 #ifdef __x86_64__
 #include <asm/prctl.h>
@@ -361,6 +375,56 @@ bool allow_socket_family(scmp_filter_ctx ctx, int family) {
     return true;
 }
 
+// (type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK) == type. Datagram and raw stay denied
+// unless a matching rule is added.
+bool allow_socket_type(scmp_filter_ctx ctx, int family, int type) {
+    int nr = seccomp_syscall_resolve_name("socket");
+    if (nr == __NR_SCMP_ERROR) return false;
+    const uint64_t type_mask = ~static_cast<uint64_t>(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 2,
+                         SCMP_CMP(0, SCMP_CMP_EQ, static_cast<uint64_t>(family)),
+                         SCMP_CMP(1, SCMP_CMP_MASKED_EQ, type_mask,
+                                  static_cast<uint64_t>(type))) < 0) {
+        std::cerr << "sandbox: seccomp socket rule failed" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Pulse and PipeWire sample buffers pass MFD_NOEXEC_SEAL. An executable memfd
+// would bypass memory-deny-write-execute, so anything without that bit dies.
+bool allow_memfd_noexec(scmp_filter_ctx ctx) {
+    int nr = seccomp_syscall_resolve_name("memfd_create");
+    if (nr == __NR_SCMP_ERROR) {
+        std::cerr << "sandbox: syscall memfd_create is not known" << std::endl;
+        return false;
+    }
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 1,
+                         SCMP_CMP(1, SCMP_CMP_MASKED_EQ,
+                                  static_cast<uint64_t>(MFD_NOEXEC_SEAL),
+                                  static_cast<uint64_t>(MFD_NOEXEC_SEAL))) < 0) {
+        std::cerr << "sandbox: seccomp memfd_create rule failed" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// A general ioctl allow is already installed. These two requests inject input
+// into the caller's terminal, so they return EPERM instead of killing the TNC.
+bool deny_tty_inject(scmp_filter_ctx ctx) {
+    int nr = seccomp_syscall_resolve_name("ioctl");
+    if (nr == __NR_SCMP_ERROR) return false;
+    const uint64_t blocked[] = {TIOCSTI, TIOCLINUX};
+    for (uint64_t request : blocked) {
+        if (seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), nr, 1,
+                             SCMP_CMP(1, SCMP_CMP_EQ, request)) < 0) {
+            std::cerr << "sandbox: seccomp ioctl inject rule failed" << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
 // libseccomp rejects a KILL_PROCESS rule that the default action already
 // covers. Allow only protections that are not writable and executable at once,
 // and let every other prot value hit the default kill.
@@ -423,9 +487,17 @@ bool allow_arch_prctl(scmp_filter_ctx ctx) {
 }
 #endif
 
-bool install_seccomp() {
+bool install_seccomp(bool inet_dgram) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
         std::cerr << "sandbox: no_new_privs failed: " << std::strerror(errno) << std::endl;
+        return false;
+    }
+    // Before the filter is loaded, so a failure does not leave seccomp installed.
+    // The argument is unsigned long: prctl is variadic.
+    if (prctl(PR_SET_MDWE, static_cast<unsigned long>(PR_MDWE_REFUSE_EXEC_GAIN),
+              0, 0, 0) != 0) {
+        std::cerr << "sandbox: memory-deny-write-execute failed: " << std::strerror(errno)
+                  << std::endl;
         return false;
     }
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL_PROCESS);
@@ -459,10 +531,10 @@ bool install_seccomp() {
         "set_tid_address", "futex", "set_robust_list", "epoll_create",
         "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait", "getdents64",
         "eventfd2", "timerfd_create", "timerfd_settime", "timerfd_gettime",
-        "pselect6", "ppoll", "getrandom", "memfd_create", "fallocate",
+        "pselect6", "ppoll", "getrandom", "fallocate",
         "mlock", "munlock", "mlockall", "munlockall", "sigaltstack",
         "rt_sigpending", "rt_sigtimedwait", "rt_sigsuspend", "restart_syscall",
-        "uname", "prlimit64", "kill", "shmget", "shmat", "shmctl", "shmdt",
+        "uname", "prlimit64", "kill",
         "timer_create", "timer_settime", "timer_gettime", "timer_delete",
         "timer_getoverrun", "alarm", "setitimer", "getitimer",
     };
@@ -482,9 +554,16 @@ bool install_seccomp() {
     for (const char* name : optional) {
         if (!allow_named(ctx, name, false)) ok = false;
     }
-    if (!allow_socket_family(ctx, AF_UNIX) || !allow_socket_family(ctx, AF_INET) ||
-        !allow_socket_family(ctx, AF_INET6) || !allow_socket_family(ctx, AF_NETLINK))
+    if (!allow_socket_family(ctx, AF_UNIX) || !allow_socket_family(ctx, AF_NETLINK))
         ok = false;
+    if (!allow_socket_type(ctx, AF_INET, SOCK_STREAM) ||
+        !allow_socket_type(ctx, AF_INET6, SOCK_STREAM))
+        ok = false;
+    if (inet_dgram &&
+        (!allow_socket_type(ctx, AF_INET, SOCK_DGRAM) ||
+         !allow_socket_type(ctx, AF_INET6, SOCK_DGRAM)))
+        ok = false;
+    if (!allow_memfd_noexec(ctx) || !deny_tty_inject(ctx)) ok = false;
     if (!allow_memory_prot(ctx, "mmap", true) ||
         !allow_memory_prot(ctx, "mprotect", true) ||
         !allow_memory_prot(ctx, "pkey_mprotect", false))
@@ -564,33 +643,20 @@ void remember_host(std::vector<std::string>* hosts, const std::string& host) {
 
 inline bool install_sandbox(const SandboxPolicy& policy) {
     int abi = landlock_abi();
-    if (abi < 4) {
+    if (abi < 6) {
         std::cerr << "sandbox: Landlock ABI " << abi
-                  << " is too old to confine TCP (need 4 or newer)" << std::endl;
+                  << " is too old (need 6 or newer for TCP and signal scoping)"
+                  << std::endl;
         return false;
     }
     landlock_ruleset_attr attr;
     std::memset(&attr, 0, sizeof(attr));
     attr.handled_access_fs = handled_fs_for(abi);
     attr.handled_access_net = handled_net_for(abi);
-    if (abi >= 6) {
-        attr.scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
-    }
-    const size_t sizes[] = {
-        offsetof(landlock_ruleset_attr, quiet_access_fs),
-        offsetof(landlock_ruleset_attr, scoped),
-        offsetof(landlock_ruleset_attr, handled_access_net),
-    };
-    int ruleset = -1;
-    for (size_t size : sizes) {
-        ruleset = static_cast<int>(syscall(SYS_landlock_create_ruleset, &attr, size, 0));
-        if (ruleset >= 0) break;
-        if (errno != EINVAL) {
-            std::cerr << "sandbox: landlock_create_ruleset failed: " << std::strerror(errno)
-                      << std::endl;
-            return false;
-        }
-    }
+    attr.scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
+    // sizeof keeps scoped inside the buffer the kernel copies. A shorter size
+    // would drop signal scoping, so there is no smaller fallback.
+    int ruleset = static_cast<int>(syscall(SYS_landlock_create_ruleset, &attr, sizeof(attr), 0));
     if (ruleset < 0) {
         std::cerr << "sandbox: landlock_create_ruleset failed: " << std::strerror(errno)
                   << std::endl;
@@ -784,7 +850,7 @@ inline bool install_sandbox(const SandboxPolicy& policy) {
     close(ruleset);
 
     if (!confinement_holds()) return false;
-    if (!install_seccomp()) return false;
+    if (!install_seccomp(need_dns)) return false;
 
     std::cerr << "sandbox: landlock ABI " << abi << ", " << fs_rules
               << " filesystem rules, TCP bind";
@@ -794,6 +860,6 @@ inline bool install_sandbox(const SandboxPolicy& policy) {
     if (connect_ports.empty()) std::cerr << " none";
     for (int port : connect_ports) std::cerr << " " << port;
     std::cerr << ", UDP DNS " << (need_dns ? "53" : "off")
-              << ", execve refused" << std::endl;
+              << ", execve refused, MDWE" << std::endl;
     return true;
 }

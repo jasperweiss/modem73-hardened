@@ -1,16 +1,17 @@
 diff --git a/modem.hh b/modem.hh
-index b77477c..9f9a36c 100644
+index b77477c..58478c0 100644
 --- a/modem.hh
 +++ b/modem.hh
-@@ -6,6 +6,7 @@
+@@ -6,6 +6,8 @@
  #include <functional>
  #include <atomic>
  #include <algorithm>
++#include <climits>
 +#include "window.hh"
  
  
  #include "phy/common.hh"
-@@ -966,6 +967,7 @@ private:
+@@ -966,6 +968,7 @@ private:
      }
      
      void process_sample(value sample, FrameCallback callback) {
@@ -18,7 +19,7 @@ index b77477c..9f9a36c 100644
  #if IMPULSE_BLANKER
          {
              value mag = std::abs(sample);
-@@ -992,6 +994,7 @@ private:
+@@ -992,6 +995,7 @@ private:
              sample = bandpass(sample);
          // Convert to complex via Hilbert transform
          cmplx tmp = hilbert(blockdc(sample));
@@ -26,7 +27,13 @@ index b77477c..9f9a36c 100644
          buf_ = input_hist(tmp);
          ring_[ring_count_ % ring_len] = tmp;
          ++ring_count_;
-@@ -1004,7 +1007,10 @@ private:
+@@ -999,12 +1003,15 @@ private:
+         
+         switch (state_) {
+         case State::SEARCHING:
+-            if ((*correlator_ptr)(buf_)) {
++            if ((*correlator_ptr)(buf_, buffer_len)) {
+                 // Sync found
                  ++stats_sync_count;
                  symbol_pos = correlator_ptr->symbol_pos;
                  cfo_rad = correlator_ptr->cfo_rad;
@@ -38,7 +45,66 @@ index b77477c..9f9a36c 100644
                      ++stats_preamble_errors;
                      reset();
                      break;
-@@ -1902,9 +1908,14 @@ private:
+@@ -1044,7 +1051,7 @@ private:
+             
+         case State::COLLECTING_SYMBOLS:
+             // Keep feeding correlator to maintain buffer
+-            (*correlator_ptr)(buf_);
++            (*correlator_ptr)(buf_, buffer_len);
+             samples_needed_--;
+ 
+             if (frame_raw_.size() < (size_t)(symbols_max + 8) * extended_len + buffer_len)
+@@ -1823,15 +1830,21 @@ private:
+         last_good_mode_ = mode;
+         bool ok = false;
+ 
++        const size_t preamble_span = (size_t)(2 * symbol_len + extended_len);
+         symbol_pos = 0;
+         buf_ = frame_raw_.data();
+         delete seq1_ptr;
+         seq1_ptr = new CODE::MLS(mls1_poly);
+-        if (first_j == 1 && process_preamble() && oper_mode == mode) {
++        if (first_j == 1 && window_at(frame_raw_, 0, preamble_span) &&
++            process_preamble() && oper_mode == mode) {
+             bool bad = false;
+             for (int j = 1; j <= symbol_count; ++j) {
+-                buf_ = frame_raw_.data() + 2 * symbol_len + guard_len
+-                     + (size_t)j * extended_len;
++                int64_t at = (int64_t)(2 * symbol_len + guard_len)
++                           + (int64_t)j * extended_len;
++                const cmplx* sym = at < 0 ? nullptr
++                    : window_at(frame_raw_, (size_t)at, (size_t)symbol_len);
++                if (!sym) { bad = true; break; }
++                buf_ = sym;
+                 if (!process_symbol(j)) { bad = true; break; }
+             }
+             if (!bad) {
+@@ -1842,7 +1855,8 @@ private:
+             }
+         }
+ 
+-        if (!ok) {
++        if (!ok && dist >= 0 && dist <= INT_MAX &&
++            window_at(frame_raw_, (size_t)dist, preamble_span)) {
+             symbol_pos = (int)dist;
+             buf_ = frame_raw_.data();
+             delete seq1_ptr;
+@@ -1867,8 +1881,12 @@ private:
+                         if (!erase_symbol(j, "Missing")) { bad = true; break; }
+                         continue;
+                     }
+-                    buf_ = frame_raw_.data() + 2 * symbol_len + guard_len
+-                         + (size_t)j * extended_len;
++                    int64_t at = (int64_t)(2 * symbol_len + guard_len)
++                               + (int64_t)j * extended_len;
++                    const cmplx* sym = at < 0 ? nullptr
++                        : window_at(frame_raw_, (size_t)at, (size_t)symbol_len);
++                    if (!sym) { bad = true; break; }
++                    buf_ = sym;
+                     if (!process_symbol(j)) { bad = true; break; }
+                 }
+                 forced_alpha_ = 0;
+@@ -1902,9 +1920,14 @@ private:
          replaying_ = true;
          bool ok = false;
          for (const auto& a : attempts) {
@@ -55,7 +121,7 @@ index b77477c..9f9a36c 100644
                  continue;
              forced_alpha_ = a.alpha;
              symbol_pos = frame_symbol_pos_ + a.dt;
-@@ -1915,7 +1926,11 @@ private:
+@@ -1915,7 +1938,11 @@ private:
                  continue;
              bool bad = false;
              for (int j = 1; j <= symbol_count; ++j) {
@@ -68,11 +134,11 @@ index b77477c..9f9a36c 100644
                  if (!process_symbol(j)) { bad = true; break; }
              }
              if (bad)
-@@ -1931,6 +1946,8 @@ private:
+@@ -1931,6 +1958,8 @@ private:
      }
  
      bool decode_frame(FrameCallback callback) {
-+        if (code_order < 0 || code_order > code_max)
++        if (code_order < 5 || code_order > code_max)
 +            return false;
          std::cerr << "Decoder: Decoding frame, k_=" << k_ << " bits collected" << std::endl;
          std::cerr << "Decoder: Expected code_order=" << code_order << " (code length=" << (1 << code_order) << ")" << std::endl;
@@ -328,3 +394,31 @@ index 2b9b152..f8ada36 100644
          const int cbits = RobustParams::code_bits(mode);
          const int nrows = RobustParams::nrows(mode);
          const int copies = RobustParams::copies(mode);
+diff --git a/schmidl_cox.hh b/schmidl_cox.hh
+index 4e5b8a3..baa3aed 100644
+--- a/schmidl_cox.hh
++++ b/schmidl_cox.hh
+@@ -65,7 +65,10 @@ public:
+ 			kern[i] = conj(kern[i]) / value(symbol_len);
+ 	}
+ 
+-	bool operator()(const cmplx *samples) {
++	bool operator()(const cmplx *samples, int samples_len) {
++		// Highest fixed index is search_pos + 2*symbol_len.
++		if (samples == nullptr || samples_len <= search_pos + 2 * symbol_len)
++			return false;
+ 		cmplx P = cor(samples[search_pos + symbol_len] * conj(samples[search_pos + 2 * symbol_len]));
+ 		value R = value(0.5) * pwr(norm(samples[search_pos + 2 * symbol_len]));
+ 		value min_R = 0.00001 * symbol_len;
+@@ -97,6 +100,11 @@ public:
+ 		symbol_pos = search_pos - index_max;
+ 		index_max = 0;
+ 		timing_max = 0;
++		// Reads [symbol_pos + symbol_len, symbol_pos + 2*symbol_len).
++		// symbol_pos may be slightly negative; the added symbol_len keeps it in range.
++		if (samples_len < 2 * symbol_len || symbol_pos < -symbol_len ||
++		    symbol_pos > samples_len - 2 * symbol_len)
++			return false;
+ 		for (int i = 0; i < symbol_len; ++i)
+ 			tmp1[i] = samples[i + symbol_pos + symbol_len] * osc();
+ 		fwd(tmp0, tmp1);

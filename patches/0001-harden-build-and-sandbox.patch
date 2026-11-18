@@ -90,16 +90,18 @@ index 3582f46..84f7a51 100644
      ui_state.load_presets();
      ui_state.load_appearance();
      ui_state.on_stop_requested = []() { g_running = false; };
-@@ -344,6 +357,8 @@ void print_help(const char* prog) {
+@@ -344,6 +357,10 @@ void print_help(const char* prog) {
                << "      --list-cm108        List CM108-compatible devices and exit\n"
  #endif
                << "      --help              Show this help\n"
-+              << "\nAfter these options are resolved, modem73 confines itself with Landlock\n"
-+              << "and seccomp. A restart request then exits instead of re-executing.\n"
++              << "\nAfter these options are resolved, modem73 confines itself with Landlock,\n"
++              << "seccomp, and memory-deny-write-execute. Internet datagrams are refused\n"
++              << "unless a hostname needs DNS. A restart request then exits instead of\n"
++              << "re-executing.\n"
                << "\nNetwork:\n"
                << "  -p, --port PORT         KISS TCP port (default: 8001)\n"
                << "      --bind ADDR         KISS bind address (default: 0.0.0.0)\n"
-@@ -1406,6 +1421,14 @@ int main(int argc, char** argv) {
+@@ -1406,6 +1423,14 @@ int main(int argc, char** argv) {
      if (config.csma_enabled)
          config.tx_blanking_enabled = true;
  
@@ -114,7 +116,7 @@ index 3582f46..84f7a51 100644
      try {
          KISSTNC tnc(config);
          g_shutdown_tnc.store(&tnc);
-@@ -2189,6 +2212,7 @@ int main(int argc, char** argv) {
+@@ -2189,6 +2214,7 @@ int main(int argc, char** argv) {
      }
      if (g_restart_requested.load()) {
          std::cerr << "Restarting modem73" << std::endl;
