@@ -523,7 +523,9 @@ bool install_seccomp(bool inet_dgram) {
         "rename", "renameat", "renameat2", "unlink", "unlinkat", "readlink",
         "readlinkat", "gettimeofday", "getrlimit", "getrusage", "sysinfo",
         "times", "getuid", "getgid", "geteuid", "getegid", "getgroups",
-        "getresuid", "getresgid", "capget", "statfs", "fstatfs",
+        // The terminal UI calls these with the process's own ids. Unprivileged
+        // code cannot use them to assume any other uid or gid.
+        "getresuid", "getresgid", "setfsuid", "setfsgid", "capget", "statfs", "fstatfs",
         "sched_getparam", "sched_setparam", "sched_setscheduler",
         "sched_getscheduler", "sched_get_priority_max", "sched_get_priority_min",
         "sched_rr_get_interval", "sched_getaffinity", "sched_setaffinity",
