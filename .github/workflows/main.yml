@@ -129,6 +129,10 @@ jobs:
             echo "::error::binary is not linked against libubsan"
             exit 1
           }
+          readelf -d modem73 | grep -q libncursesw || {
+            echo "::error::binary is not linked against libncursesw - the TUI writes UTF-8 box drawing"
+            exit 1
+          }
 
       - name: Stage install tree
         working-directory: src

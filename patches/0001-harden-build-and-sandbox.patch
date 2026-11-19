@@ -128,6 +128,15 @@ diff --git a/packaging/Makefile.pkg b/packaging/Makefile.pkg
 index bd9b753..1a0f29f 100644
 --- a/packaging/Makefile.pkg
 +++ b/packaging/Makefile.pkg
+@@ -8,7 +8,7 @@ GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
+ GIT_BASE := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+ VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(if $(GIT_BASE),$(GIT_BASE)-dev,dev))
+ CXXFLAGS += -DMODEM73_VERSION=\"$(VERSION)\"
+-LDFLAGS = -lpthread -ltinfo -lncurses -ldl -lm
++LDFLAGS = -lpthread -ltinfo -lncursesw -ldl -lm
+ 
+ PREFIX ?= /usr
+ DESTDIR ?=
 @@ -21,7 +21,7 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
  
  TARGET = modem73
